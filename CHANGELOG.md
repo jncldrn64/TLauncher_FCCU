@@ -1,76 +1,82 @@
 # Changelog
 
-All notable changes to the TLauncher Sandbox launcher (`run.sh` and helpers).
-Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This is a
-single growing file — never one file per round.
+Every notable change to the launcher (`run.sh` & its helpers). The format follows
+[Keep a Changelog](https://keepachangelog.com/). One file that grows by section,
+never one file per round.
 
-## v2.5 — Round 2
+## v2.5: Round 2
 
 ### Added
-- **Sandbox-only mode (no arguments)** is now explicit: a bare `./run.sh` prints a
-  start line (`...no monitoring — use -M to enable...`) and a symmetric end line
-  with TLauncher's exit code on stderr, while still creating nothing under
-  `tlauncher-logs/`. It previously launched correctly but gave no end feedback, so
-  it looked dead — a UX gap, not a logic bug.
-- **Network payload summary** for `-P` captures, via the new
-  `scripts/mitm_report.py`: one compact line per request
-  (host/method/path/status/req+resp bytes) plus a **Flagged requests** subsection
-  (non-allowlist hosts, or POST/PUT with a body) with truncated bodies — the part
-  that answers "did it actually send anything?".
-- **Domain regression check**: new baseline
-  `tlauncher-sandbox-baseline-domains.txt` and `-B/--save-baseline SESSION_DIR` to
-  derive it (plus the IP baseline) from a session you trust. The incident report's
-  **Regression check** section flags first-seen domains (`⚠ NEW DOMAIN`) and
-  hard-flags known risk patterns (`🚨 NEW RISKY DOMAIN`, e.g. `advancedrepository`)
-  even if already baselined. Pure text, no extra network.
-- **`DESIGN.md`** documenting the project's conventions.
+- Sandbox-only mode for a bare `./run.sh`. It prints one start line
+  (`...no monitoring, use -M to enable...`) & one end line carrying TLauncher's
+  exit code to stderr, & it writes nothing under `tlauncher-logs/`. Before this it
+  launched fine but printed no end line, so it looked dead. That was a feedback
+  gap, not a logic bug.
+- Network payload summary for `-P` captures, through the new
+  `scripts/mitm_report.py`. It prints one line per request
+  (host, method, path, status, request bytes, response bytes) & a
+  "Flagged requests" block for any off-allowlist host or any POST/PUT that carried
+  a body, with the body truncated at 2048 bytes. That block answers the only
+  question that matters: did it send anything.
+- Domain regression check. A new baseline file,
+  `tlauncher-sandbox-baseline-domains.txt`, plus `-B/--save-baseline SESSION_DIR`
+  to build it from a session you trust. The report's "Regression check" section
+  marks a first-seen domain with `NEW DOMAIN` & a known-risky one with
+  `NEW RISKY DOMAIN`, flagging `advancedrepository` even when it's already in the
+  baseline. Text comparison only, no extra network.
+- `DESIGN.md`, the first written copy of the project's conventions.
 
 ### Changed
-- `usage()` audited line-by-line against the real parser (documents sandbox-only
-  mode, corrects `-M`/`-a`/`-m`, notes the standalone flags, lists baseline files).
-- The payload section distinguishes "capture disabled" from "nothing suspicious"
-  instead of conflating them under the same silence.
+- Audited `usage()` line by line against the real parser: it now documents the
+  sandbox-only mode, corrects the `-M`/`-a`/`-m` descriptions, names the
+  standalone flags, & lists the baseline files.
+- The payload section says "capture disabled" when there's no `mitm.flow`, so
+  "nothing captured" & "nothing suspicious" stop hiding under the same silence.
 
-## v2.4 — Round 1
+## v2.4: Round 1
 
 ### Fixed
-- **Orphaned monitors (critical).** The monitor block used to run inside a
-  `( ... ) 200>"$LOCKFILE"` subshell, so the PIDs the monitors appended to the
-  global `MONITOR_PIDS` never reached the parent shell and the cleanup loop always
-  ran over an empty array. Every `inotifywait`/`ss`/`ps` was orphaned and kept
-  writing into old logs (one stray `inotifywait` grew a `files.log` to 51 MB). Now
-  the lock is held via an `exec`'d fd in the current shell, and cleanup reaps whole
-  process trees (`kill_tree`, TERM→KILL) so no reparented leaf survives.
-- Latent `set -e` traps: `log_verbose` now `return 0`s (a bare call returning
-  non-zero aborted non-verbose runs); the `grep -c ... || echo 0` idiom that
-  emitted `0\n0` and crashed `printf %d` was corrected; `USER` is guarded when
+- Orphaned monitors, the critical bug. The monitor block ran inside a
+  `( ... ) 200>"$LOCKFILE"` subshell, so the PIDs it appended to the global
+  `MONITOR_PIDS` never reached the parent shell, & the cleanup loop ran over an
+  empty array. Every `inotifywait`/`ss`/`ps` got orphaned & kept writing into old
+  logs; one stray `inotifywait` grew a single `files.log` to 51 MB. The lock now
+  lives on an `exec`'d descriptor in the current shell, & cleanup reaps whole
+  process trees with `kill_tree`, TERM then KILL, so no reparented leaf survives.
+- Three `set -e` traps. `log_verbose` now ends with `return 0`, because a bare
+  call returning non-zero aborted every non-verbose run. The `grep -c ... || echo 0`
+  idiom that printed `0\n0` & crashed `printf %d` got fixed. `USER` is guarded when
   unset.
 
 ### Added
-- `-K/--kill-orphans` to reap strays from previous sessions (excludes the script's
-  own ancestor chain so it can't kill its launching shell).
-- Filesystem **noise filtering**: lossless `files.log` plus a small, readable
-  `signal.log` driven by `NOISE_PATTERNS`.
-- **First-seen** process/network logging instead of full periodic dumps — orders of
-  magnitude less volume while still surfacing anything new.
-- Aggregated, KB-sized **`INCIDENT_REPORT.md`** per session.
-- **Log retention** (`-c/--cleanup-logs [DAYS]`), also run silently at the start of
-  every `-M` run so the directory never balloons.
-- Opt-in **mitmproxy capture** (`-P/--proxy [PORT]`), no sudo; injects the JVM
-  proxy properties (the JVM ignores `HTTP(S)_PROXY` env vars by default) and
-  disables itself cleanly if `mitmdump` is absent.
+- `-K/--kill-orphans` to reap strays from earlier sessions. It excludes the
+  script's own ancestor chain so it can't kill the shell that launched it.
+- Filesystem noise filtering: a lossless `files.log` plus a small `signal.log`
+  driven by `NOISE_PATTERNS`. One real session logged 5,346 events into
+  `signal.log` against 178,756 raw MODIFY events seen in about 30 minutes.
+- First-seen process & network logging instead of a full `ps`/`ss` dump every 2
+  seconds, which had produced a 42 MB `java-processes.log` per session.
+- `INCIDENT_REPORT.md`, one aggregated report per session, 5.7 KB on a real run.
+- Log retention through `-c/--cleanup-logs [DAYS]`, default 7 days, with a 500 MB
+  cap. It also runs silently at the start of every `-M` run, after the directory
+  reached 2 GB on its own.
+- Opt-in mitmproxy capture through `-P/--proxy [PORT]`, default port 8080, no
+  sudo. It sets the JVM proxy properties, because the JVM ignores `HTTP_PROXY`
+  environment variables by default, & it turns itself off cleanly when `mitmdump`
+  is absent.
 
-## Round 3 — documentation only
+## Round 3: documentation only
 
 ### Fixed
-- Added `tl.vg` to `MITM_ALLOWLIST` — a legitimate TLauncher domain seen alongside
-  `repo.tlauncher.org` in a real session. Without it, `-P` captures would flag
-  benign `tl.vg` traffic as off-allowlist. (Data correction, not a logic change.)
+- Added `tl.vg` to `MITM_ALLOWLIST`. It's a legitimate TLauncher domain seen in
+  the same session as `repo.tlauncher.org`. Without it a `-P` capture would flag
+  benign `tl.vg` traffic as off-allowlist. Data correction, no logic change.
 
 ### Added
 - This `CHANGELOG.md`.
-- `AGENTS.md` onboarding entry point for anyone (human or agent) resuming the
-  project cold.
-- `DESIGN.md` §6: verbosity is a function of who invokes a tool, not an absolute —
-  human-invoked tools are never mute, auto-fired ones (hotkey/cron/hook) may and
-  should fail in total silence.
+- `AGENTS.md`, a short cold-start entry point with an honest "Known gaps" section.
+  It records that `-P` never ran end to end against a real `mitmdump`, & that the
+  `tlauncher.ru` family isn't yet a hard risk pattern.
+- `DESIGN.md` section 6: verbosity depends on who invokes a tool. A human-invoked
+  tool never goes mute (rule 5); a hotkey, cron, or window-manager hook may fail
+  in total silence.
