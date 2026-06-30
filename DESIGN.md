@@ -79,7 +79,28 @@ safety net only**, never the primary handle. Cleanup reaps whole process trees
 - `log_verbose` must `return 0` (a bare call returning non-zero aborts the
   script under `set -e`).
 
-## 6. Idempotence & cleanup
+## 6. Verbosity is a function of who invokes you, not an absolute
+
+Rule 5 ("never mute") is **not universal** — it is the correct behavior for *this*
+tool because of how it is invoked. The right verbosity depends on who pulls the
+trigger:
+
+- **Invoked consciously by a human watching a terminal** (like `run.sh`): never
+  mute. A person is waiting to see a result, so an invisible failure is worse than
+  a little noise. Always emit at least a start/end line, surface errors on stderr,
+  exit with a meaningful code. This is rule 5.
+- **Fired automatically with nobody watching** (a keyboard-shortcut helper, a cron
+  job, a window-manager hook): the *opposite* is correct on purpose. These should
+  fail in total silence — chained `|| exit 0` at each step — because an error
+  message there only interrupts; no one will ever read it. Silence is the feature.
+
+So a sibling utility that swallows every error without a peep is **not** violating
+rule 5 — it is a different rule for a different context. When adding or judging a
+script, first ask "who launches this, and is anyone looking?"; pick the verbosity
+from the answer, not from a fixed notion of "correct". (Principle only — do not
+copy code from those other tools into this repo.)
+
+## 7. Idempotence & cleanup
 
 Every resource the script creates has an explicit teardown/regeneration path,
 and `usage()` tells the user about it:
@@ -92,7 +113,7 @@ and `usage()` tells the user about it:
 | Baseline files      | `-B/--save-baseline` | Delete to reset; re-run `-B` to recreate |
 | Orphaned monitors   | (shouldn't happen)| `-K/--kill-orphans` reaps strays            |
 
-## 7. Report size discipline
+## 8. Report size discipline
 
 `INCIDENT_REPORT.md` (and any summary fed to a human or an LLM) stays in the **KB**
 range, never MB. Full captures (`files.log`, `mitm.flow`) are kept on disk but
