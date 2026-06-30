@@ -10,14 +10,24 @@
 #   - A short, post-session INCIDENT_REPORT.md aggregates the signal.
 #   - Log retention so the directory never silently grows into the GBs.
 #   - Optional, opt-in real HTTP(S) capture via mitmproxy.
+#   - Domain regression check against a user-curated baseline.
 #
 # HARD CONSTRAINT: this script must NEVER call sudo, prompt for a password, or
 # require elevated capabilities beyond what firejail already uses internally.
 # (Installing packages like mitmproxy/sqlite3 by hand, outside this script, is
 # the user's responsibility and is fine — the script itself stays unprivileged.)
+#
+# DESIGN CONVENTIONS: see DESIGN.md next to this script for the project's style
+# guide (XDG everywhere, zero sudo, flock-in-same-scope, $!-tracked background
+# jobs, standard CLI idioms, silent-by-default-but-never-mute). New features must
+# respect those conventions.
 set -euo pipefail
 
-VERSION="2.4"
+VERSION="2.5"
+
+# Directory containing this script (used to locate helper scripts like
+# scripts/mitm_report.py). Resolved once, robust to being called via a symlink.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 # ==========================================
 # CONFIGURATION
@@ -61,6 +71,12 @@ CLEANUP_DAYS=7           # default retention window (days)
 LOG_SIZE_CAP_MB=500      # delete old compressed sessions once dir exceeds this
 PROXY_ENABLED=false      # -P: opt-in mitmproxy HTTP(S) capture
 PROXY_PORT=8080          # default mitmproxy listen port
+SAVE_BASELINE_SESSION="" # -B DIR: derive baseline files from a clean session, then exit
+
+# Baseline files (XDG_DATA_HOME, same pattern as everything else). The IP one is
+# pre-existing; the domains one drives the regression check (Round 2 / Task 3).
+BASELINE_IPS="${XDG_DATA_HOME}/tlauncher-sandbox-baseline-ips.txt"
+BASELINE_DOMAINS="${XDG_DATA_HOME}/tlauncher-sandbox-baseline-domains.txt"
 
 # Monitoring
 SESSION_ID=""
@@ -99,6 +115,16 @@ MITM_ALLOWLIST=(
     "tlauncher.org" "fastrepo.org" "mojang.com" "forgecdn.net"
     "curseforge.com" "minecraft.net" "microsoft.com" "live.com" "xboxlive.com"
 )
+
+# Known-risky domain substrings for the regression check (Task 3). A domain that
+# matches any of these is flagged hard in INCIDENT_REPORT.md even if it is already
+# in the baseline — these are the fallback/telemetry domains the author distrusts
+# (e.g. TLauncher's plain-HTTP update fallback). Extend by hand as new ones surface.
+RISK_DOMAIN_PATTERNS=(
+    'advancedrepository'
+    'securelogger'
+)
+RISK_DOMAIN_REGEX="$(IFS='|'; printf '%s' "${RISK_DOMAIN_PATTERNS[*]}")"
 
 # Blocked domains (for reference in logs)
 BLOCKED_DOMAINS=(
@@ -602,7 +628,14 @@ run_sandboxed() {
         monitor_mitmproxy || true
     fi
 
-    log_msg "Launching TLauncher in sandbox..."
+    # Start line — ALWAYS printed (log_msg → stderr regardless of -v). Sandbox-only
+    # mode (no flags) is a first-class mode, not an accident of defaults: a bare
+    # `./run.sh` must never look dead, so it gets its own explicit message.
+    if session_logging_active; then
+        log_msg "Launching TLauncher in sandbox..."
+    else
+        log_msg "Launching TLauncher in sandbox (no monitoring — use -M to enable)..."
+    fi
 
     # Run firejail. errexit is disabled around this block so a non-zero TLauncher
     # exit does not skip monitor cleanup / report generation.
@@ -634,8 +667,11 @@ run_sandboxed() {
     fi
     set -e
 
+    # End line — ALWAYS printed, symmetric with the start line, so even silent
+    # sandbox-only mode confirms completion (and surfaces a non-zero exit code).
+    log_msg "TLauncher exited (code: $exit_code)"
+
     if session_logging_active; then
-        log_msg "TLauncher exited (code: $exit_code)"
         log_msg "Stopping monitors..."
 
         stop_monitors
@@ -679,6 +715,122 @@ fs_event_log() {
         printf "%s" "${s}/signal.log"
     else
         printf "%s" "${s}/files.log"
+    fi
+}
+
+# Extract the set of domains TLauncher probed, from a session's tlauncher.log.
+# Real lines look like:
+#   "... check internet connection https://repo.tlauncher.org/check.bin timeout ..."
+# and may be nested inside a ConsoleSubscriber wrapper — the URL still appears, so
+# a single grep over the whole line is enough. Pure text, no network.
+extract_session_domains() {
+    local log="$1"
+    [ -s "$log" ] || return 0
+    grep -oE 'check internet connection https?://[^/ ]+' "$log" 2>/dev/null \
+        | sed -E 's#.*https?://##' | sort -u
+}
+
+# -B/--save-baseline: derive baseline files from a session the user considers
+# "clean", so future runs can diff against them. Mirrors the manual baseline the
+# user could write by hand — just automated. Writes under XDG_DATA_HOME.
+save_baseline() {
+    local session="$1"
+    [ -d "$session" ] || die "save-baseline: session directory not found: $session"
+    mkdir -p "$(dirname "$BASELINE_DOMAINS")"
+
+    local domains; domains="$(extract_session_domains "${session}/tlauncher.log")"
+    if [ -n "$domains" ]; then
+        printf '%s\n' "$domains" > "$BASELINE_DOMAINS"
+        log_msg "Wrote $(printf '%s\n' "$domains" | grep -c .) domain(s) to $BASELINE_DOMAINS"
+    else
+        log_warn "No 'check internet connection' lines in ${session}/tlauncher.log — domain baseline not written."
+        log_warn "(Domain extraction needs a -M or -P session's tlauncher.log.)"
+    fi
+
+    if [ -s "${session}/network.log" ]; then
+        grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "${session}/network.log" 2>/dev/null | sort -u > "$BASELINE_IPS"
+        log_msg "Wrote $(grep -c . "$BASELINE_IPS") IP(s) to $BASELINE_IPS"
+    else
+        log_warn "No network.log in $session — IP baseline left unchanged."
+    fi
+}
+
+# Markdown section: real network payload summary from a -P proxy capture (Task 2).
+# Delegates the flow parsing to scripts/mitm_report.py (kept separate so the heavy
+# mitmproxy-specific logic doesn't bloat run.sh). Degrades clearly at every step:
+# no capture / no python3 / no helper / parse failure each say something distinct.
+report_payload_summary() {
+    local session="$1"
+    local flow="${session}/mitm.flow"
+    printf "## Network payload summary (proxy capture)\n\n"
+    if [ ! -f "$flow" ]; then
+        # "Nothing suspicious" and "nothing captured" are DIFFERENT — say so plainly.
+        printf "_Payload capture was **disabled** for this session (run without \`-P/--proxy\`)._\n\n"
+        printf "_To actually inspect what TLauncher sends on the wire, re-run with_ \`%s -P\` _(requires mitmdump)._\n\n" "$(basename "$0")"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf "_python3 not available to summarize; raw flow saved at \`mitm.flow\`._\n\n"
+        return 0
+    fi
+    local helper="${SCRIPT_DIR}/scripts/mitm_report.py"
+    if [ ! -f "$helper" ]; then
+        printf "_Helper \`scripts/mitm_report.py\` not found next to run.sh; raw flow at \`mitm.flow\`._\n\n"
+        return 0
+    fi
+    MITM_ALLOW="$(IFS=,; printf '%s' "${MITM_ALLOWLIST[*]}")" \
+    MITM_TRUNCATE="2048" \
+    python3 "$helper" "$flow" 2>/dev/null \
+        || printf "_Could not parse mitm.flow (is the mitmproxy python module installed?). Raw flow at \`mitm.flow\`._\n"
+    printf "\n"
+}
+
+# Markdown section: domain regression vs the curated baseline (Task 3). Pure text
+# comparison — no extra network, no outbound telemetry. Flags first-seen domains
+# and, harder, any domain matching a known risk pattern (even if baselined).
+report_regression_check() {
+    local session="$1"
+    local log="${session}/tlauncher.log"
+    printf "## Regression check\n\n"
+    if [ ! -s "$log" ]; then
+        printf "_No \`tlauncher.log\` for this session (sandbox-only run, or a pre-2.5 session) — domain regression check skipped._\n\n"
+        return 0
+    fi
+    local domains; domains="$(extract_session_domains "$log")"
+    if [ -z "$domains" ]; then
+        printf "_No domain-probe lines found in tlauncher.log; nothing to compare._\n\n"
+        return 0
+    fi
+
+    # Risk-pattern domains seen this session — flagged regardless of the baseline,
+    # because these are exactly the fallback/telemetry hosts the author distrusts.
+    if [ -n "$RISK_DOMAIN_REGEX" ]; then
+        local risky; risky="$(printf '%s\n' "$domains" | grep -E "$RISK_DOMAIN_REGEX" || true)"
+        if [ -n "$risky" ]; then
+            printf "**🚨 Known risk-pattern domains contacted this session:**\n\n\`\`\`\n%s\n\`\`\`\n\n" "$risky"
+        fi
+    fi
+
+    if [ -f "$BASELINE_DOMAINS" ]; then
+        printf "_Compared against domain baseline: \`%s\`_\n\n" "$BASELINE_DOMAINS"
+        local newdoms; newdoms="$(comm -23 <(printf '%s\n' "$domains" | sort -u) <(sort -u "$BASELINE_DOMAINS") 2>/dev/null)"
+        if [ -z "$newdoms" ]; then
+            printf "✓ No new domains — every contacted domain is already in the baseline.\n\n"
+        else
+            local d
+            while IFS= read -r d; do
+                [ -z "$d" ] && continue
+                if [ -n "$RISK_DOMAIN_REGEX" ] && printf '%s' "$d" | grep -qE "$RISK_DOMAIN_REGEX"; then
+                    printf "🚨 NEW RISKY DOMAIN: \`%s\`\n" "$d"
+                else
+                    printf "⚠ NEW DOMAIN: \`%s\`\n" "$d"
+                fi
+            done <<< "$newdoms"
+            printf "\n"
+        fi
+    else
+        printf "_No domain baseline at \`%s\`. Create it from a session you trust with_ \`%s -B SESSION_DIR\` _(or edit by hand). Domains seen this session:_\n\n" "$BASELINE_DOMAINS" "$(basename "$0")"
+        printf '```\n%s\n```\n\n' "$domains"
     fi
 }
 
@@ -751,7 +903,7 @@ generate_incident_report() {
     fi
 
     local report="${session}/INCIDENT_REPORT.md"
-    local baseline="${XDG_DATA_HOME}/tlauncher-sandbox-baseline-ips.txt"
+    local baseline="$BASELINE_IPS"
     local fslog; fslog="$(fs_event_log "$session")"
 
     {
@@ -829,63 +981,9 @@ generate_incident_report() {
         fi
         printf "\n"
 
-        # --- mitmproxy capture summary ---
-        if [ -f "${session}/mitm.flow" ]; then
-            printf "## HTTP(S) capture (mitmproxy)\n\n"
-            if command -v python3 >/dev/null 2>&1; then
-                MITM_ALLOW="$(IFS=,; printf '%s' "${MITM_ALLOWLIST[*]}")" \
-                python3 - "${session}/mitm.flow" <<'PYEOF' 2>/dev/null || printf "_Could not parse mitm.flow (mitmproxy python module missing?). Raw flow kept at mitm.flow._\n"
-import os, sys
-try:
-    from mitmproxy import io, http
-except Exception:
-    print("_mitmproxy python module not available; raw flow saved at mitm.flow._")
-    sys.exit(0)
-allow = tuple(d for d in os.environ.get("MITM_ALLOW", "").split(",") if d)
-def allowed(h):
-    return any(h == d or h.endswith("." + d) for d in allow)
-rows, bodies = [], []
-try:
-    with open(sys.argv[1], "rb") as f:
-        for fl in io.FlowReader(f).stream():
-            if not isinstance(fl, http.HTTPFlow):
-                continue
-            req, res = fl.request, fl.response
-            host = req.pretty_host
-            status = res.status_code if res else "-"
-            size = len(res.raw_content) if (res and res.raw_content) else 0
-            rows.append((host, req.method, req.path, status, size))
-            interesting = (not allowed(host)) or (req.method in ("POST", "PUT") and req.raw_content)
-            if interesting:
-                try:
-                    body = req.get_text() or ""
-                except Exception:
-                    body = ""
-                bodies.append((req.method, host, req.path, body))
-except Exception as e:
-    print("_Error reading flow: %s_" % e)
-    sys.exit(0)
-print("| Host | Method | Path | Status | Resp bytes |")
-print("|------|--------|------|--------|-----------|")
-for h, m, p, s, sz in rows[:80]:
-    pp = (p[:58] + "…") if len(p) > 58 else p
-    pp = pp.replace("|", "%7C")
-    print("| %s | %s | %s | %s | %s |" % (h, m, pp, s, sz))
-if len(rows) > 80:
-    print("\n_…%d more requests omitted._" % (len(rows) - 80))
-if bodies:
-    print("\n### Request bodies (non-allowlisted hosts or POST/PUT)\n")
-    for m, h, p, b in bodies[:20]:
-        print("- **%s %s%s**" % (m, h, p))
-        b = (b or "").strip()
-        if b:
-            print("\n```\n%s\n```\n" % b[:1000])
-PYEOF
-            else
-                printf "_python3 not available to summarize; raw flow at mitm.flow._\n"
-            fi
-            printf "\n"
-        fi
+        # --- Network payload summary (Task 2) + domain regression (Task 3) ---
+        report_payload_summary "$session"
+        report_regression_check "$session"
 
         # --- Sizes (growth sanity check) ---
         printf "## Sizes\n\n"
@@ -1268,40 +1366,53 @@ usage() {
     printf "  activity logs including operations that don't appear in normal logs.\n\n"
 
     printf "${YELLOW}USAGE${NC}\n"
-    printf "  %s [OPTIONS]\n\n" "$0"
+    printf "  %s [OPTIONS]\n" "$0"
+    printf "  ${CYAN}With no options: sandbox-only mode — launches TLauncher in the firejail${NC}\n"
+    printf "  ${CYAN}sandbox with NO monitoring and NO logs, printing only a start and end${NC}\n"
+    printf "  ${CYAN}line to stderr. Add -M to record a session, -v to see TLauncher output.${NC}\n\n"
 
     printf "${YELLOW}BASIC OPTIONS${NC}\n"
-    printf "  ${BLUE}-v, --verbose${NC}          Show TLauncher output in terminal\n"
-    printf "  ${BLUE}-n, --offline${NC}          Block ALL network (force offline mode)\n"
+    printf "  ${BLUE}-v, --verbose${NC}          Show TLauncher output + config summary + 2s countdown\n"
+    printf "  ${BLUE}-n, --offline${NC}          Block ALL network (firejail --net=none)\n"
     printf "  ${BLUE}-f, --file PATH${NC}        Specify TLauncher.jar location\n"
-    printf "  ${BLUE}-h, --help${NC}             Show this help\n\n"
+    printf "  ${BLUE}-h, --help${NC}             Show this help and exit 0\n\n"
 
     printf "${YELLOW}MONITORING OPTIONS${NC}\n"
-    printf "  ${BLUE}-M, --monitor${NC}          Enable comprehensive monitoring:\n"
-    printf "                           • Filesystem events (inotifywait, noise-filtered)\n"
-    printf "                           • Network connections (ss, first-seen)\n"
-    printf "                           • Process activity (first-seen, not full dumps)\n"
+    printf "  ${BLUE}-M, --monitor${NC}          Enable monitoring + write a session under logs/:\n"
+    printf "                           • Filesystem events (inotifywait → files.log, plus a\n"
+    printf "                             noise-filtered signal.log)\n"
+    printf "                           • Network connections (ss, first-seen → network.log)\n"
+    printf "                           • Sandbox/Java processes (first-seen, not full dumps)\n"
     printf "                           • Suspicious directory detection\n"
-    printf "                           • Java subprocess tracking (first-seen)\n"
-    printf "  ${BLUE}-a, --analyze${NC}          Auto-analyze results after execution\n"
-    printf "  ${BLUE}-A, --analyze-only${NC}     Analyze latest session WITHOUT running\n\n"
+    printf "                           • SUMMARY.txt, TIMELINE.txt and INCIDENT_REPORT.md\n"
+    printf "  ${BLUE}-a, --analyze${NC}          After a -M run, print the full analysis to the\n"
+    printf "                           terminal (no-op without -M; a warning is shown)\n"
+    printf "  ${BLUE}-A, --analyze-only${NC}     Analyze the latest session and exit (no launch)\n\n"
 
     printf "${YELLOW}MAINTENANCE / REPORTING${NC}\n"
     printf "  ${BLUE}-K, --kill-orphans${NC}     Find & kill stray monitor processes from old\n"
     printf "                           sessions, then exit (does NOT launch TLauncher)\n"
     printf "  ${BLUE}-R, --report DIR${NC}       (Re)generate INCIDENT_REPORT.md for a session\n"
     printf "                           directory, then exit\n"
+    printf "  ${BLUE}-B, --save-baseline DIR${NC} Derive baseline files from a session you trust\n"
+    printf "                           (domains from its tlauncher.log, IPs from network.log),\n"
+    printf "                           then exit. Used by the regression check below.\n"
     printf "  ${BLUE}-c, --cleanup-logs [N]${NC} Compress sessions older than N days (default %d),\n" "$CLEANUP_DAYS"
     printf "                           prune compressed ones over the %dMB cap, then exit.\n" "$LOG_SIZE_CAP_MB"
     printf "                           ${CYAN}This also runs automatically (silently) at the${NC}\n"
-    printf "                           ${CYAN}start of every -M run so logs never balloon.${NC}\n\n"
+    printf "                           ${CYAN}start of every -M run so logs never balloon.${NC}\n"
+    printf "  ${CYAN}-K/-R/-c/-B/-A are standalone: they do their job and exit without${NC}\n"
+    printf "  ${CYAN}launching TLauncher. If several are given, the first in that order wins.${NC}\n\n"
 
     printf "${YELLOW}NETWORK CAPTURE (opt-in, no sudo)${NC}\n"
     printf "  ${BLUE}-P, --proxy [PORT]${NC}     Route sandbox HTTP(S) through mitmproxy on\n"
     printf "                           127.0.0.1:PORT (default %d) and record mitm.flow.\n" "$PROXY_PORT"
+    printf "                           Implies a session dir (like -M) for the capture.\n"
     printf "                           Requires 'mitmdump' (pip install mitmproxy\n"
     printf "                           --break-system-packages). If missing, the flag is\n"
     printf "                           skipped and the run continues normally.\n"
+    printf "                           The incident report then gets a 'Network payload\n"
+    printf "                           summary' with one line per request + flagged bodies.\n"
     printf "                           ${CYAN}HTTPS note:${NC} the JVM must trust the mitmproxy CA.\n"
     printf "                           After the first run, trust it inside the sandbox e.g.:\n"
     printf "                             keytool -importcert -noprompt -alias mitmproxy \\\\\n"
@@ -1311,36 +1422,46 @@ usage() {
     printf "                           Without trust, HTTPS requests will fail TLS inside.\n\n"
 
     printf "${YELLOW}SECURITY CHECKS${NC}\n"
-    printf "  ${BLUE}-m, --mozilla${NC}          Check for .mozilla directory access\n"
-    printf "  ${BLUE}-ml, --mozilla-path${NC}    Custom mozilla path (default: ~/.mozilla)\n\n"
+    printf "  ${BLUE}-m, --mozilla${NC}          Add a .mozilla check to the analysis output\n"
+    printf "                           (takes effect with -a or -A; the incident report\n"
+    printf "                           always includes a basic .mozilla check regardless)\n"
+    printf "  ${BLUE}-ml, --mozilla-path P${NC}  Custom mozilla path (default: \$HOME/.mozilla)\n\n"
+
+    printf "${YELLOW}BASELINES & REGRESSION (text-only, no extra network)${NC}\n"
+    printf "  IPs:     %s\n" "$BASELINE_IPS"
+    printf "  Domains: %s\n" "$BASELINE_DOMAINS"
+    printf "  ${CYAN}Populate them with '-B SESSION_DIR' from a run you consider clean (or by${NC}\n"
+    printf "  ${CYAN}hand). The incident report then flags new IPs and, under 'Regression${NC}\n"
+    printf "  ${CYAN}check', any first-seen domain — hard-flagging known risk patterns${NC}\n"
+    printf "  ${CYAN}(e.g. advancedrepository) even if already baselined. Delete the files${NC}\n"
+    printf "  ${CYAN}to reset; re-run -B to regenerate.${NC}\n\n"
 
     printf "${YELLOW}COMMON USAGE PATTERNS${NC}\n"
-    printf "  ${GREEN}Quick run:${NC}\n"
-    printf "    %s\n\n" "$0"
+    printf "  ${GREEN}Sandbox-only (no monitoring, just run it safely):${NC}\n"
+    printf "    %s\n" "$0"
+    printf "    ${CYAN}→ Start/end lines on stderr, no session dir, nothing under logs/${NC}\n\n"
 
     printf "  ${GREEN}First time / security audit:${NC}\n"
     printf "    %s -v -M -a -m\n" "$0"
     printf "    ${CYAN}→ Full monitoring with immediate analysis${NC}\n\n"
 
-    printf "  ${GREEN}With real HTTP(S) capture:${NC}\n"
+    printf "  ${GREEN}With real HTTP(S) capture + regression:${NC}\n"
     printf "    %s -M -a -P\n" "$0"
-    printf "    ${CYAN}→ Adds a mitmproxy summary to the incident report${NC}\n\n"
+    printf "    ${CYAN}→ Adds the network payload summary + regression check to the report${NC}\n\n"
 
-    printf "  ${GREEN}Reap leftover monitors / tidy logs:${NC}\n"
-    printf "    %s -K        %s -c 7\n\n" "$0" "$0"
+    printf "  ${GREEN}Save a clean baseline, then reap monitors / tidy logs:${NC}\n"
+    printf "    %s -B logs/session_XXXX   %s -K   %s -c 7\n\n" "$0" "$0" "$0"
 
     printf "  ${GREEN}Review previous session:${NC}\n"
     printf "    %s -A\n" "$0"
     printf "    ${CYAN}→ Analyze logs without running TLauncher${NC}\n\n"
 
-    printf "${YELLOW}WHAT'S NEW IN v2.4${NC}\n"
-    printf "  ${GREEN}✓${NC} Fixed monitor cleanup (no more orphaned inotifywait/ss/ps)\n"
-    printf "  ${GREEN}✓${NC} -K to reap strays from previous sessions\n"
-    printf "  ${GREEN}✓${NC} Noise-filtered filesystem signal.log (small, readable)\n"
-    printf "  ${GREEN}✓${NC} First-seen process logging (orders of magnitude less volume)\n"
-    printf "  ${GREEN}✓${NC} Aggregated INCIDENT_REPORT.md per session\n"
-    printf "  ${GREEN}✓${NC} Automatic log retention (-c) so the dir never balloons\n"
-    printf "  ${GREEN}✓${NC} Opt-in mitmproxy capture (-P), no sudo\n\n"
+    printf "${YELLOW}WHAT'S NEW IN v2.5${NC}\n"
+    printf "  ${GREEN}✓${NC} Explicit sandbox-only mode with start/end feedback (no-arg run)\n"
+    printf "  ${GREEN}✓${NC} usage() audited line-by-line against the real parser\n"
+    printf "  ${GREEN}✓${NC} Deeper -P payload summary (per-request + flagged bodies)\n"
+    printf "  ${GREEN}✓${NC} Domain regression check vs a curated baseline (-B to populate)\n"
+    printf "  ${GREEN}✓${NC} DESIGN.md documenting the project's conventions\n\n"
 
     printf "${YELLOW}OUTPUT LOCATION${NC}\n"
     printf "  %s/session_YYYYMMDD_HHMMSS/\n\n" "$LOG_ROOT"
@@ -1396,6 +1517,13 @@ main() {
                     shift
                 fi
                 ;;
+            -B|--save-baseline)
+                if [ -z "${2:-}" ]; then
+                    die "--save-baseline requires a session directory argument"
+                fi
+                SAVE_BASELINE_SESSION="$2"
+                shift 2
+                ;;
             -ml|--mozilla-path)
                 if [ -z "${2:-}" ]; then
                     die "--mozilla-path requires a path argument"
@@ -1439,6 +1567,11 @@ main() {
 
     if [ "$CLEANUP_LOGS_FLAG" = true ]; then
         cleanup_logs "$CLEANUP_DAYS" false
+        exit 0
+    fi
+
+    if [ -n "$SAVE_BASELINE_SESSION" ]; then
+        save_baseline "$SAVE_BASELINE_SESSION"
         exit 0
     fi
 
