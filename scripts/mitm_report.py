@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Summarize a mitmproxy capture (mitm.flow) into compact Markdown.
 
-Invoked by run.sh's generate_incident_report() (Round 2 / Task 2). The goal is to
-answer, at a glance and without opening mitmproxy by hand: *did TLauncher send
-anything to a host outside the expected set, and what exactly was it?*
+run.sh's generate_incident_report() calls this (Round 2, Task 2). It answers one
+question without making the user open mitmproxy by hand: did TLauncher send
+anything to a host outside the expected set, and what was it.
 
-Contract (kept stable so run.sh can rely on it):
+Contract, kept stable so run.sh can rely on it:
   argv[1]            path to a mitmproxy flow file (written by `mitmdump -w`)
   env MITM_ALLOW     comma-separated allowlist of benign domains (suffix match)
   env MITM_TRUNCATE  max bytes of a flagged request body to print (default 2048)
 
-Output is Markdown on stdout, intentionally KB-sized: a one-line-per-request
-table, plus a "Flagged requests" subsection with bodies for anything that is
-NOT in the allowlist, or is a POST/PUT with a non-empty body. Never dumps the
-whole flow. Exits 0 even when it can't parse, printing a Markdown note instead,
-so the surrounding report still renders. No network, no sudo — pure file read.
+Output is Markdown on stdout & stays in the KB range: one line per request, then
+a "Flagged requests" block with bodies for anything off the allowlist or any
+POST/PUT that carried a body. It never dumps the whole flow. It exits 0 even when
+it can't parse, printing a Markdown note instead, so the report still renders. No
+network, no sudo, one file read.
 """
 import os
 import sys
@@ -72,7 +72,7 @@ def main() -> int:
                     except Exception:
                         body = ""
                     flagged.append((req.method, host, req.path, allowed(host), body))
-    except Exception as exc:  # noqa: BLE001 — degrade to a note, never crash the report
+    except Exception as exc:  # noqa: BLE001; degrade to a note, never crash the report
         print("_Could not read mitm.flow: %s_" % _esc(str(exc)))
         return 0
 
@@ -89,12 +89,12 @@ def main() -> int:
             % (_esc(host), _esc(method), _esc(short), status, req_size, res_size)
         )
     if len(rows) > 120:
-        print("\n_…%d more requests omitted (see mitm.flow)._" % (len(rows) - 120))
+        print("\n_%d more requests in mitm.flow._" % (len(rows) - 120))
 
     # The section that must be impossible to miss: "did it send anything?"
     print("\n### Flagged requests (non-allowlist or non-empty POST/PUT)\n")
     if not flagged:
-        print("_None — every request went to an allowlisted host with no POST/PUT body._")
+        print("_None. Every request went to an allowlisted host with no POST/PUT body._")
         return 0
     for method, host, path, host_ok, body in flagged[:25]:
         reason = "POST/PUT body" if host_ok else "off-allowlist host"
@@ -104,10 +104,10 @@ def main() -> int:
             shown = body[:truncate]
             print("\n```\n%s\n```" % shown)
             if len(body) > truncate:
-                print("_…body truncated at %d bytes (full body in mitm.flow)._" % truncate)
+                print("_Body truncated at %d bytes; full body in mitm.flow._" % truncate)
         print("")
     if len(flagged) > 25:
-        print("_…%d more flagged requests omitted (see mitm.flow)._" % (len(flagged) - 25))
+        print("_%d more flagged requests in mitm.flow._" % (len(flagged) - 25))
     return 0
 
 

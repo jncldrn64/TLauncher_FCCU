@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 # TLauncher Sandboxed Launcher
-# Secure sandbox with comprehensive monitoring capabilities
+# Runs TLauncher under firejail & records what it touches.
 #
-# Hardening goals of this revision (see also the inline "WHY" comments):
-#   - Background monitors must ALWAYS be reaped — no orphaned inotifywait/ss/ps
-#     processes left writing into old session logs.
-#   - Logs must stay small enough for a human (or an LLM) to read: noise filtering
-#     for the filesystem monitor and "first-seen" semantics for process monitors.
-#   - A short, post-session INCIDENT_REPORT.md aggregates the signal.
-#   - Log retention so the directory never silently grows into the GBs.
-#   - Optional, opt-in real HTTP(S) capture via mitmproxy.
-#   - Domain regression check against a user-curated baseline.
+# What this revision buys (see the inline "WHY" comments for the details):
+#   - Every background monitor gets reaped. A stray inotifywait once wrote a
+#     single files.log to 51 MB; that doesn't happen anymore.
+#   - Logs stay small enough for a person or an LLM to read: the filesystem
+#     monitor filters noise & the process monitors log first-seen lines only.
+#   - INCIDENT_REPORT.md aggregates the signal into about 5.7 KB per session.
+#   - Retention keeps the log directory off the 2 GB it once reached on its own.
+#   - Opt-in HTTP(S) capture through mitmproxy, off by default.
+#   - A domain regression check against a baseline the user curates.
 #
-# HARD CONSTRAINT: this script must NEVER call sudo, prompt for a password, or
-# require elevated capabilities beyond what firejail already uses internally.
-# (Installing packages like mitmproxy/sqlite3 by hand, outside this script, is
-# the user's responsibility and is fine — the script itself stays unprivileged.)
+# HARD CONSTRAINT: this script never calls sudo, never asks for a password, &
+# never needs a capability beyond what firejail drops on its own. Installing
+# mitmproxy or sqlite3 by hand, outside this script, is the user's job; the
+# script itself stays unprivileged.
 #
-# DESIGN CONVENTIONS: see DESIGN.md next to this script for the project's style
-# guide (XDG everywhere, zero sudo, flock-in-same-scope, $!-tracked background
-# jobs, standard CLI idioms, silent-by-default-but-never-mute). New features must
-# respect those conventions.
+# CONVENTIONS: DESIGN.md sits next to this script & holds the style guide. XDG
+# paths everywhere, zero sudo, flock in the same scope, background jobs tracked
+# by $!, standard CLI grammar, silent by default but never mute. A new feature
+# follows those or it doesn't ship.
 set -euo pipefail
 
 VERSION="2.5"
 
-# Directory containing this script (used to locate helper scripts like
-# scripts/mitm_report.py). Resolved once, robust to being called via a symlink.
+# Directory holding this script, used to find helpers like scripts/mitm_report.py.
+# Resolved once & survives being called through a symlink.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 # ==========================================
@@ -91,9 +91,9 @@ PROTECTED_DIRS=(
 )
 
 # Filesystem noise: extended-regex fragments matched against each inotifywait
-# event line. Anything that matches is considered benign engine churn and kept
-# ONLY in files.log (lossless) — it is excluded from signal.log, which is the
-# small file humans/analysis read first. Edit freely to tune your environment.
+# event line. A match is benign engine churn. It still lands in files.log, which
+# stays lossless, but it's kept out of signal.log, the small file a person or the
+# analysis reads first. Edit the array to fit your environment.
 NOISE_PATTERNS=(
     'mesa_shader_cache/'
     '\.sqlite-wal$'
@@ -117,9 +117,9 @@ MITM_ALLOWLIST=(
 )
 
 # Known-risky domain substrings for the regression check (Task 3). A domain that
-# matches any of these is flagged hard in INCIDENT_REPORT.md even if it is already
-# in the baseline — these are the fallback/telemetry domains the author distrusts
-# (e.g. TLauncher's plain-HTTP update fallback). Extend by hand as new ones surface.
+# matches any of these gets flagged hard in INCIDENT_REPORT.md even when it's
+# already in the baseline. These are the fallback & telemetry domains the author
+# distrusts; advancedrepository probes over plain HTTP. Add new ones by hand.
 RISK_DOMAIN_PATTERNS=(
     'advancedrepository'
     'securelogger'
@@ -158,10 +158,10 @@ log_msg() {
 }
 
 log_verbose() {
-    # NOTE: explicit `return 0` — otherwise, when VERBOSE=false the `&&` chain
-    # yields exit status 1 and, under `set -e`, a bare `log_verbose ...` call
-    # aborts the whole script. This previously broke any non-verbose run (e.g.
-    # the documented `-M -a` "normal monitoring" pattern).
+    # The explicit `return 0` is load-bearing. With VERBOSE=false the `&&` chain
+    # returns exit status 1, & under `set -e` a bare `log_verbose ...` call then
+    # aborts the whole script. That bug killed every non-verbose run, including
+    # the documented `-M -a` pattern, until this line was added.
     [ "$VERBOSE" = true ] && log_msg "$@"
     return 0
 }
@@ -184,13 +184,13 @@ die() {
 # PROCESS HELPERS (orphan-proof cleanup)
 # ==========================================
 
-# Recursively kill a process and all of its descendants.
+# Recursively kill a process & all of its descendants.
 #
-# WHY: the background monitors are bash shells that spawn long-running leaf tools
-# (inotifywait -m, ss, ps, mitmdump). If we only `kill $pid` the shell, the leaf
-# tool is reparented to init and KEEPS WRITING to the inherited log fd — this is
-# exactly how a single orphaned inotifywait grew one session's files.log to 51MB.
-# Killing children first (depth-first) avoids that reparent race.
+# WHY: each background monitor is a bash shell that spawns a long-running leaf
+# tool (inotifywait -m, ss, ps, mitmdump). Kill only the shell & the leaf gets
+# reparented to init, where it keeps writing to the inherited log fd. That's how
+# one orphaned inotifywait grew a session's files.log to 51 MB. Killing children
+# first, depth-first, closes the reparent race.
 kill_tree() {
     local pid="$1" sig="${2:-TERM}" child
     for child in $(pgrep -P "$pid" 2>/dev/null); do
@@ -199,15 +199,15 @@ kill_tree() {
     kill "-${sig}" "$pid" 2>/dev/null || true
 }
 
-# Print PIDs of stray monitor processes left over from previous sessions, matched
-# by command-line pattern. Used by -K and by the start-of-run orphan warning.
-# Each of our monitors is launched as `bash -c <body> tlauncher-mon-<sid>-<name>`
-# (argv[0] tag), plus we match the known leaf tools as a deeper safety net.
+# Print PIDs of stray monitor processes left from previous sessions, matched by
+# command-line pattern. Used by -K & by the start-of-run orphan warning. Each
+# monitor launches as `bash -c <body> tlauncher-mon-<sid>-<name>`, so the argv[0]
+# tag is the handle; the known leaf tools are matched too as a deeper backstop.
 find_orphan_pids() {
-    # Build an exclusion list of THIS process plus its whole ancestor chain, so a
-    # fuzzy `pgrep -f` can never flag (and kill) the very shell that launched us —
-    # e.g. an interactive shell whose history/command line happens to contain the
-    # tag string. Genuine strays from previous sessions are never our ancestors.
+    # Exclude THIS process & its whole ancestor chain, so a fuzzy `pgrep -f` can't
+    # flag & kill the shell that launched us. An interactive shell whose command
+    # line happens to contain the tag string would otherwise match. A genuine stray
+    # from a previous session is never our ancestor.
     local excl="$$" pid="$$"
     while :; do
         pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
@@ -357,11 +357,11 @@ build_firejail_params() {
         params+=(--net=none)
     fi
 
-    # Proxy capture (-P): expose HTTP(S)_PROXY to non-JVM helpers inside the
-    # sandbox. The JVM itself does NOT honour these env vars by default — that is
-    # handled separately via -Dhttp.proxyHost/-Dhttps.proxyHost on the java
-    # command (see run_sandboxed). Without --net the sandbox shares the host net
-    # namespace, so 127.0.0.1:PORT reaches the host mitmdump.
+    # Proxy capture (-P): expose HTTP(S)_PROXY to the non-JVM helpers inside the
+    # sandbox. The JVM ignores these env vars by default, so the JVM side is
+    # handled with -Dhttp.proxyHost/-Dhttps.proxyHost on the java command (see
+    # run_sandboxed). Without --net the sandbox shares the host network namespace,
+    # so 127.0.0.1:PORT reaches the mitmdump running on the host.
     if [ "$PROXY_ENABLED" = true ]; then
         params+=(--env=HTTP_PROXY=http://127.0.0.1:${PROXY_PORT})
         params+=(--env=HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT})
@@ -394,17 +394,18 @@ session_logging_active() {
 # MONITORING SETUP
 # ==========================================
 
-# Shared shell preamble injected into every backgrounded monitor. Because each
-# monitor is a separate `bash -c` process (so we can tag its argv[0]), it does
-# NOT inherit this script's functions — we ship the helpers it needs as text.
+# Shared shell preamble injected into every backgrounded monitor. Each monitor is
+# a separate `bash -c` process so its argv[0] can carry the tag, & a separate
+# process doesn't inherit this script's functions. So the helpers it needs ship
+# here as text & get prepended to every monitor body.
 read -r -d '' MONITOR_PREAMBLE <<'PREAMBLE' || true
 # first_seen_loop LOGFILE SEENFILE PRODUCER_CMD INTERVAL
-# Emits a line to LOGFILE only when PRODUCER_CMD output contains a line not seen
-# before ("NEW:"), and once when a previously-seen line disappears ("ENDED:").
-# WHY: the old monitors dumped a full `ps auxf`/`ss` snapshot every 2s, producing
-# tens of MB of near-identical noise. First-seen keeps the same detection power
-# (new/suspicious processes still surface immediately) at ~1-2 orders of magnitude
-# less volume.
+# Writes to LOGFILE only when PRODUCER_CMD prints a line it hasn't seen ("NEW:"),
+# & once when a line it had seen disappears ("ENDED:").
+# WHY: the old monitors dumped a full `ps auxf`/`ss` snapshot every 2 seconds &
+# produced a 42 MB java-processes.log per session, nearly all of it identical.
+# First-seen catches a new or suspicious process just as fast at a fraction of the
+# bytes.
 first_seen_loop() {
     local logfile="$1" seen="$2" producer="$3" interval="${4:-2}"
     local ended="${seen}.ended"
@@ -436,12 +437,11 @@ first_seen_loop() {
 }
 PREAMBLE
 
-# Launch a monitor body as a tagged background process and track its PID.
+# Launch a monitor body as a tagged background process & track its PID.
 #
-# WHY the tag: argv[0] = "tlauncher-mon-<session>-<name>" lets cleanup()/-K find
-# and kill strays by pattern even if PID tracking is ever lost. We deliberately
-# do NOT use setsid here so that $! is the bash PID we can track precisely;
-# descendants are reaped by kill_tree().
+# WHY the tag: argv[0] = "tlauncher-mon-<session>-<name>" lets cleanup() & -K find
+# strays by pattern if PID tracking ever slips. There's no setsid here on purpose,
+# so $! is the bash PID we can track exactly; kill_tree() reaps the descendants.
 spawn_monitor() {
     local name="$1" body="$2"
     bash -c "${MONITOR_PREAMBLE}
@@ -453,8 +453,9 @@ ${body}" "tlauncher-mon-${SESSION_ID}-${name}" &
 
 monitor_filesystem() {
     log_verbose "Starting filesystem monitor..."
-    # Every event goes to files.log (lossless). Events that do NOT match the noise
-    # regex are ALSO copied to signal.log — the small file analysis reads first.
+    # Every event goes to files.log, which stays lossless. An event that doesn't
+    # match the noise regex also gets copied to signal.log, the small file the
+    # analysis reads first.
     spawn_monitor "filesystem" '
         sleep 0.3
         inotifywait -m -r \
@@ -541,11 +542,11 @@ monitor_suspicious_dirs() {
 }
 
 monitor_mitmproxy() {
-    # -P/--proxy: opt-in real HTTP(S) capture. Strictly optional — if mitmdump is
-    # not installed we disable the flag for this run and keep going (we never abort
-    # the whole launch over a missing optional dependency).
+    # -P/--proxy: opt-in HTTP(S) capture, optional. No mitmdump means the flag
+    # turns off for this run & the launch continues. A missing optional dependency
+    # never aborts the whole thing.
     if ! command -v mitmdump >/dev/null 2>&1; then
-        log_warn "mitmdump not found — -P/--proxy disabled for this run."
+        log_warn "mitmdump not found; -P/--proxy disabled for this run."
         log_warn "Install manually (no sudo for the script itself): pip install mitmproxy --break-system-packages"
         PROXY_ENABLED=false
         return 1
@@ -554,8 +555,8 @@ monitor_mitmproxy() {
         log_warn "-P/--proxy with -n/--offline: sandbox has no network, nothing will be captured."
     fi
     log_msg "Starting mitmproxy capture on 127.0.0.1:${PROXY_PORT} (flow → mitm.flow)"
-    # exec replaces the tag-bash with mitmdump; $! stays valid for kill_tree, and
-    # -K still matches it via the "mitmdump .*tlauncher-logs" pattern.
+    # exec replaces the tag-bash with mitmdump; $! stays valid for kill_tree, &
+    # -K still matches it through the "mitmdump .*tlauncher-logs" pattern.
     spawn_monitor "mitm" '
         exec mitmdump -p "$PROXY_PORT" -w "$SESSION_DIR/mitm.flow" --flow-detail 1 \
             > "$SESSION_DIR/mitm.log" 2>&1
@@ -571,9 +572,9 @@ run_sandboxed() {
     mapfile -t firejail_params < <(build_firejail_params)
 
     # Build the in-sandbox java command. With -P we add the JVM proxy system
-    # properties: the JVM does NOT read HTTP_PROXY/HTTPS_PROXY env vars by default,
-    # so the firejail --env settings alone would NOT route Java traffic through
-    # mitmproxy — these -D properties are what actually do it.
+    # properties. The JVM doesn't read HTTP_PROXY/HTTPS_PROXY env vars by default,
+    # so the firejail --env settings alone wouldn't route Java traffic through
+    # mitmproxy. These -D properties are what actually route it.
     local java_opts=""
     if [ "$PROXY_ENABLED" = true ]; then
         java_opts="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=${PROXY_PORT}"
@@ -593,16 +594,15 @@ run_sandboxed() {
     fi
 
     # ----------------------------------------------------------------------
-    # WHY (critical fix): this used to be wrapped in a ( ... ) 200>"$LOCKFILE"
-    # subshell. MONITOR_PIDS is a global array, but the monitor_* helpers ran
-    # INSIDE that subshell, so the PIDs they appended never propagated to the
-    # parent shell. The later cleanup loop therefore always iterated an EMPTY
-    # array and every background monitor (inotifywait/ss/ps) was orphaned —
-    # which is what retroactively contaminated old logs (a stray inotifywait
-    # grew one files.log to 51MB).
+    # WHY (the critical fix): this block used to sit inside a ( ... ) 200>"$LOCKFILE"
+    # subshell. MONITOR_PIDS is a global array, but the monitor_* helpers ran inside
+    # that subshell, so the PIDs they appended never reached the parent shell. The
+    # cleanup loop then iterated an empty array & every background monitor got
+    # orphaned. That's what contaminated old logs; a stray inotifywait grew one
+    # files.log to 51 MB.
     #
-    # Fix: hold the lock via an exec'd fd in the CURRENT shell. Now the monitors,
-    # MONITOR_PIDS, and the code that kills them all live in the same scope.
+    # The fix: hold the lock on an exec'd fd in the current shell. The monitors,
+    # MONITOR_PIDS, & the code that kills them now share one scope.
     # ----------------------------------------------------------------------
     exec 200>"$LOCKFILE"
     flock -n 200 || die "TLauncher already running (lockfile exists)"
@@ -628,13 +628,13 @@ run_sandboxed() {
         monitor_mitmproxy || true
     fi
 
-    # Start line — ALWAYS printed (log_msg → stderr regardless of -v). Sandbox-only
-    # mode (no flags) is a first-class mode, not an accident of defaults: a bare
-    # `./run.sh` must never look dead, so it gets its own explicit message.
+    # Start line, always printed: log_msg writes to stderr no matter the -v state.
+    # The no-flag sandbox-only run is a real mode, not a gap in the defaults, so a
+    # bare `./run.sh` never looks dead. It gets its own message.
     if session_logging_active; then
         log_msg "Launching TLauncher in sandbox..."
     else
-        log_msg "Launching TLauncher in sandbox (no monitoring — use -M to enable)..."
+        log_msg "Launching TLauncher in sandbox (no monitoring, use -M to enable)..."
     fi
 
     # Run firejail. errexit is disabled around this block so a non-zero TLauncher
@@ -667,8 +667,8 @@ run_sandboxed() {
     fi
     set -e
 
-    # End line — ALWAYS printed, symmetric with the start line, so even silent
-    # sandbox-only mode confirms completion (and surfaces a non-zero exit code).
+    # End line, always printed, to match the start line. Even the silent
+    # sandbox-only mode confirms it finished & shows a non-zero exit code.
     log_msg "TLauncher exited (code: $exit_code)"
 
     if session_logging_active; then
@@ -718,11 +718,11 @@ fs_event_log() {
     fi
 }
 
-# Extract the set of domains TLauncher probed, from a session's tlauncher.log.
-# Real lines look like:
+# Extract the domains TLauncher probed, from a session's tlauncher.log. The real
+# lines read:
 #   "... check internet connection https://repo.tlauncher.org/check.bin timeout ..."
-# and may be nested inside a ConsoleSubscriber wrapper — the URL still appears, so
-# a single grep over the whole line is enough. Pure text, no network.
+# & a ConsoleSubscriber wrapper sometimes nests them, but the URL still shows up,
+# so one grep over the whole line catches it. Text only, no network.
 extract_session_domains() {
     local log="$1"
     [ -s "$log" ] || return 0
@@ -730,9 +730,9 @@ extract_session_domains() {
         | sed -E 's#.*https?://##' | sort -u
 }
 
-# -B/--save-baseline: derive baseline files from a session the user considers
-# "clean", so future runs can diff against them. Mirrors the manual baseline the
-# user could write by hand — just automated. Writes under XDG_DATA_HOME.
+# -B/--save-baseline: build the baseline files from a session the user trusts, so
+# later runs can diff against them. It writes the same files the user could type by
+# hand, under XDG_DATA_HOME.
 save_baseline() {
     local session="$1"
     [ -d "$session" ] || die "save-baseline: session directory not found: $session"
@@ -743,7 +743,7 @@ save_baseline() {
         printf '%s\n' "$domains" > "$BASELINE_DOMAINS"
         log_msg "Wrote $(printf '%s\n' "$domains" | grep -c .) domain(s) to $BASELINE_DOMAINS"
     else
-        log_warn "No 'check internet connection' lines in ${session}/tlauncher.log — domain baseline not written."
+        log_warn "No 'check internet connection' lines in ${session}/tlauncher.log; domain baseline not written."
         log_warn "(Domain extraction needs a -M or -P session's tlauncher.log.)"
     fi
 
@@ -751,20 +751,20 @@ save_baseline() {
         grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "${session}/network.log" 2>/dev/null | sort -u > "$BASELINE_IPS"
         log_msg "Wrote $(grep -c . "$BASELINE_IPS") IP(s) to $BASELINE_IPS"
     else
-        log_warn "No network.log in $session — IP baseline left unchanged."
+        log_warn "No network.log in $session; IP baseline left unchanged."
     fi
 }
 
-# Markdown section: real network payload summary from a -P proxy capture (Task 2).
-# Delegates the flow parsing to scripts/mitm_report.py (kept separate so the heavy
-# mitmproxy-specific logic doesn't bloat run.sh). Degrades clearly at every step:
-# no capture / no python3 / no helper / parse failure each say something distinct.
+# Markdown section: the network payload summary from a -P proxy capture (Task 2).
+# The flow parsing goes to scripts/mitm_report.py, kept in its own file so the
+# mitmproxy logic stays out of run.sh. Every step degrades to a distinct line: no
+# capture, no python3, no helper, & parse failure each say something different.
 report_payload_summary() {
     local session="$1"
     local flow="${session}/mitm.flow"
     printf "## Network payload summary (proxy capture)\n\n"
     if [ ! -f "$flow" ]; then
-        # "Nothing suspicious" and "nothing captured" are DIFFERENT — say so plainly.
+        # "Nothing suspicious" & "nothing captured" are different; say which.
         printf "_Payload capture was **disabled** for this session (run without \`-P/--proxy\`)._\n\n"
         printf "_To actually inspect what TLauncher sends on the wire, re-run with_ \`%s -P\` _(requires mitmdump)._\n\n" "$(basename "$0")"
         return 0
@@ -785,15 +785,15 @@ report_payload_summary() {
     printf "\n"
 }
 
-# Markdown section: domain regression vs the curated baseline (Task 3). Pure text
-# comparison — no extra network, no outbound telemetry. Flags first-seen domains
-# and, harder, any domain matching a known risk pattern (even if baselined).
+# Markdown section: domain regression against the curated baseline (Task 3). Text
+# comparison only, no extra network & no outbound telemetry. It flags a first-seen
+# domain, & harder, any domain matching a known risk pattern even when baselined.
 report_regression_check() {
     local session="$1"
     local log="${session}/tlauncher.log"
     printf "## Regression check\n\n"
     if [ ! -s "$log" ]; then
-        printf "_No \`tlauncher.log\` for this session (sandbox-only run, or a pre-2.5 session) — domain regression check skipped._\n\n"
+        printf "_No \`tlauncher.log\` for this session (sandbox-only run, or a pre-2.5 session); domain regression check skipped._\n\n"
         return 0
     fi
     local domains; domains="$(extract_session_domains "$log")"
@@ -802,8 +802,8 @@ report_regression_check() {
         return 0
     fi
 
-    # Risk-pattern domains seen this session — flagged regardless of the baseline,
-    # because these are exactly the fallback/telemetry hosts the author distrusts.
+    # Risk-pattern domains seen this session, flagged whether or not they're in the
+    # baseline, because these are the fallback & telemetry hosts the author distrusts.
     if [ -n "$RISK_DOMAIN_REGEX" ]; then
         local risky; risky="$(printf '%s\n' "$domains" | grep -E "$RISK_DOMAIN_REGEX" || true)"
         if [ -n "$risky" ]; then
@@ -815,7 +815,7 @@ report_regression_check() {
         printf "_Compared against domain baseline: \`%s\`_\n\n" "$BASELINE_DOMAINS"
         local newdoms; newdoms="$(comm -23 <(printf '%s\n' "$domains" | sort -u) <(sort -u "$BASELINE_DOMAINS") 2>/dev/null)"
         if [ -z "$newdoms" ]; then
-            printf "✓ No new domains — every contacted domain is already in the baseline.\n\n"
+            printf "✓ No new domains; every contacted domain is already in the baseline.\n\n"
         else
             local d
             while IFS= read -r d; do
@@ -867,11 +867,11 @@ generate_summary() {
 
         # File system events (from the noise-filtered signal log when available)
         if [ -s "$fslog" ]; then
-            # NOTE: `grep -c` already prints 0 on no match (and exits 1). The old
-            # `|| echo 0` ADDED a second 0, yielding "0\n0" and a printf %d crash
-            # under set -e — which now happens routinely because signal.log is
-            # noise-filtered and often has zero MODIFY events. `|| true` keeps the
-            # single clean 0 and only swallows the exit code.
+            # NOTE: `grep -c` already prints 0 on no match & exits 1. The old
+            # `|| echo 0` added a second 0, so the value became "0\n0" & printf %d
+            # crashed under set -e. signal.log is noise-filtered & often has zero
+            # MODIFY events, so this fired on normal runs. `|| true` keeps the one
+            # clean 0 & swallows only the exit code.
             local total_events=$(wc -l < "$fslog" 2>/dev/null || true); total_events=${total_events:-0}
             local creates=$(grep -c "CREATE" "$fslog" 2>/dev/null || true); creates=${creates:-0}
             local modifies=$(grep -c "MODIFY" "$fslog" 2>/dev/null || true); modifies=${modifies:-0}
@@ -907,7 +907,7 @@ generate_incident_report() {
     local fslog; fslog="$(fs_event_log "$session")"
 
     {
-        printf "# TLauncher Sandbox — Incident Report\n\n"
+        printf "# TLauncher Sandbox: Incident Report\n\n"
         printf -- "- Session: \`%s\`\n" "$(basename "$session")"
         printf -- "- Generated: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
         printf -- "- Filesystem source: \`%s\`\n\n" "$(basename "$fslog")"
@@ -943,7 +943,7 @@ generate_incident_report() {
                     printf "_All observed IPs are present in the baseline._\n"
                 fi
             else
-                printf "_No baseline file at \`%s\` — listing ALL observed IPs (populate that file from a run you consider clean to enable diffing)._\n\n" "$baseline"
+                printf "_No baseline file at \`%s\`; listing every observed IP. Populate that file from a run you consider clean to enable diffing._\n\n" "$baseline"
                 printf '```\n%s\n```\n' "${ips:-(none)}"
             fi
         else
@@ -958,7 +958,7 @@ generate_incident_report() {
             if [ -n "$nf" ]; then
                 local total; total="$(printf '%s\n' "$nf" | grep -c . || true)"; total=${total:-0}
                 printf '```\n%s\n```\n' "$(printf '%s\n' "$nf" | head -60)"
-                [ "$total" -gt 60 ] && printf "\n_…%d more — see signal.log / files.log._\n" "$((total - 60))"
+                [ "$total" -gt 60 ] && printf "\n_%d more files in signal.log / files.log._\n" "$((total - 60))"
             else
                 printf "_None._\n"
             fi
@@ -974,7 +974,7 @@ generate_incident_report() {
             if [ "$mfiles" -eq 0 ]; then
                 printf "⚠ \`.mozilla\` exists in sandbox but is empty (likely benign).\n"
             else
-                printf "🚨 \`.mozilla\` exists in sandbox with **%d files** — manual inspection recommended.\n" "$mfiles"
+                printf "🚨 \`.mozilla\` exists in sandbox with **%d files**; inspect it by hand.\n" "$mfiles"
             fi
         else
             printf "✓ No \`.mozilla\` directory in sandbox.\n"
@@ -1330,11 +1330,11 @@ check_mozilla_directory() {
 
 cleanup() {
     # Stop monitors started in this run, reaping their whole process trees so no
-    # inotifywait/ss/ps/mitmdump leaf survives to write into old logs. This runs
-    # from the EXIT/INT/TERM trap too (e.g. the user Ctrl+C's mid-session), so it
-    # mirrors stop_monitors' TERM→KILL escalation rather than a single TERM pass —
-    # a lone TERM can lose a leaf to a reparent race and leave exactly the kind of
-    # orphan this whole revision exists to prevent.
+    # inotifywait/ss/ps/mitmdump leaf survives to write into old logs. The
+    # EXIT/INT/TERM trap calls this too, say when the user hits Ctrl+C mid-session,
+    # so it escalates TERM then KILL like stop_monitors instead of a single TERM
+    # pass. A lone TERM can lose a leaf to a reparent race & leave the exact orphan
+    # this revision exists to prevent.
     if [ "${#MONITOR_PIDS[@]}" -gt 0 ]; then
         local pid
         for pid in "${MONITOR_PIDS[@]}"; do kill_tree "$pid" TERM; done
@@ -1367,8 +1367,8 @@ usage() {
 
     printf "${YELLOW}USAGE${NC}\n"
     printf "  %s [OPTIONS]\n" "$0"
-    printf "  ${CYAN}With no options: sandbox-only mode — launches TLauncher in the firejail${NC}\n"
-    printf "  ${CYAN}sandbox with NO monitoring and NO logs, printing only a start and end${NC}\n"
+    printf "  ${CYAN}With no options: sandbox-only mode. It launches TLauncher in the firejail${NC}\n"
+    printf "  ${CYAN}sandbox with no monitoring and no logs, printing only a start and end${NC}\n"
     printf "  ${CYAN}line to stderr. Add -M to record a session, -v to see TLauncher output.${NC}\n\n"
 
     printf "${YELLOW}BASIC OPTIONS${NC}\n"
@@ -1432,7 +1432,7 @@ usage() {
     printf "  Domains: %s\n" "$BASELINE_DOMAINS"
     printf "  ${CYAN}Populate them with '-B SESSION_DIR' from a run you consider clean (or by${NC}\n"
     printf "  ${CYAN}hand). The incident report then flags new IPs and, under 'Regression${NC}\n"
-    printf "  ${CYAN}check', any first-seen domain — hard-flagging known risk patterns${NC}\n"
+    printf "  ${CYAN}check', any first-seen domain, hard-flagging known risk patterns${NC}\n"
     printf "  ${CYAN}(e.g. advancedrepository) even if already baselined. Delete the files${NC}\n"
     printf "  ${CYAN}to reset; re-run -B to regenerate.${NC}\n\n"
 
@@ -1575,12 +1575,12 @@ main() {
         exit 0
     fi
 
-    # Proxy preflight: decide mitmdump availability NOW, before any session
-    # directory, firejail --env, or java -Dproxy settings are derived from
-    # PROXY_ENABLED. Otherwise a missing mitmdump would still inject proxy
-    # settings that point at a dead port and break TLauncher's networking.
+    # Proxy preflight: settle mitmdump availability now, before any session
+    # directory, firejail --env, or java -Dproxy setting derives from PROXY_ENABLED.
+    # Skip this & a missing mitmdump would still inject proxy settings pointing at a
+    # dead port, which breaks TLauncher's networking.
     if [ "$PROXY_ENABLED" = true ] && ! command -v mitmdump >/dev/null 2>&1; then
-        log_warn "mitmdump not found — -P/--proxy disabled for this run."
+        log_warn "mitmdump not found; -P/--proxy disabled for this run."
         log_warn "Install manually (no sudo for the script): pip install mitmproxy --break-system-packages"
         PROXY_ENABLED=false
     fi
