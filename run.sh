@@ -112,7 +112,7 @@ NOISE_REGEX="$(IFS='|'; printf '%s' "${NOISE_PATTERNS[*]}")"
 # Hosts considered benign for the mitmproxy summary (full request bodies are only
 # surfaced for hosts NOT in this list, or for non-empty POST/PUT bodies).
 MITM_ALLOWLIST=(
-    "tlauncher.org" "fastrepo.org" "mojang.com" "forgecdn.net"
+    "tlauncher.org" "fastrepo.org" "tl.vg" "mojang.com" "forgecdn.net"
     "curseforge.com" "minecraft.net" "microsoft.com" "live.com" "xboxlive.com"
 )
 
